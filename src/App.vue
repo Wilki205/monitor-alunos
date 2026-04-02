@@ -30,12 +30,15 @@ const allAttendance = ref([])
 // --- CARREGAMENTO INICIAL ---
 async function fetchData() {
   loading.value = true
+  
   const [resCourses, resStudents, resAssignments, resSubmissions, resAttendance] = await Promise.all([
     supabase.from('courses').select('*').order('name'),
     supabase.from('students').select('*').order('name'),
-    supabase.from('assignments').select('*').order('due_date', { ascending: false }),
-    supabase.from('submissions').select('*, assignments(course_id)'),
-    supabase.from('attendance').select('*')
+    
+    // Mantendo o limite alto para garantir que pegamos tudo (o filtro será feito no front)
+    supabase.from('assignments').select('*').order('due_date', { ascending: false }).range(0, 50000),
+    supabase.from('submissions').select('*, assignments(course_id)').range(0, 50000),
+    supabase.from('attendance').select('*').range(0, 50000)
   ])
 
   if (resCourses.data) courses.value = resCourses.data
@@ -47,24 +50,51 @@ async function fetchData() {
   loading.value = false
 }
 
-// --- DADOS FILTRADOS ---
+// --- DADOS FILTRADOS (COM CORREÇÃO PARA DESAFIOS/PROJETOS) ---
 const dashboardCourses = computed(() => {
   if (selectedCourse.value === 'all') return courses.value
   return courses.value.filter(c => c.id === selectedCourse.value)
 })
 
+// 👇 AQUI ESTÁ A CORREÇÃO PRINCIPAL 👇
+// 👇 Substitua a computed 'dashboardAssignments' por esta versão atualizada 👇
 const dashboardAssignments = computed(() => {
-  if (selectedCourse.value === 'all') return assignments.value
-  return assignments.value.filter(a => a.course_id === selectedCourse.value)
+  // 1. Filtra por Curso
+  let result = assignments.value
+  if (selectedCourse.value !== 'all') {
+    result = result.filter(a => a.course_id === selectedCourse.value)
+  }
+
+  // 2. Filtra por Palavras-Chave (WHITELIST)
+  const keywords = ['desafio', 'miniprojeto', 'mini-projeto', 'mini projeto']
+  
+  // 3. Filtra por Palavras Proibidas (BLACKLIST)
+  // Adicione aqui qualquer palavra que, se aparecer, deve cancelar a atividade
+  const blacklist = ['feedback', 'apresentação', 'dúvidas']
+
+  return result.filter(a => {
+    const titleLower = (a.title || '').toLowerCase()
+    
+    // Tem que ter uma palavra boa...
+    const hasKeyword = keywords.some(key => titleLower.includes(key))
+    
+    // ...E NÃO pode ter nenhuma palavra proibida
+    const hasForbidden = blacklist.some(bad => titleLower.includes(bad))
+
+    return hasKeyword && !hasForbidden
+  })
 })
+// 👆 FIM DA CORREÇÃO 👆
 
 const dashboardSubmissions = computed(() => {
+  // Só considera submissões de atividades que passaram no filtro acima
   const validAssignmentIds = dashboardAssignments.value.map(a => a.id)
   return submissions.value.filter(s => validAssignmentIds.includes(s.assignment_id))
 })
 
 const dashboardStudents = computed(() => {
   if (selectedCourse.value === 'all') return students.value
+  // Mostra apenas alunos que têm alguma relação com as atividades filtradas
   const activeStudentIds = new Set(dashboardSubmissions.value.map(s => s.student_id))
   return students.value.filter(s => activeStudentIds.has(s.id))
 })
@@ -79,20 +109,18 @@ const availableLessons = computed(() => {
   if (selectedCourse.value === 'all') return []
   
   const lessonsSet = new Set()
-  // 1. Descobre todas as aulas possíveis (lendo os títulos das atividades)
+  // Só vai procurar "Aula XX" dentro dos Desafios/Projetos filtrados
   dashboardAssignments.value.forEach(a => {
     const match = a.title.match(/(Aula\s+\d+)/i)
     if (match) lessonsSet.add(match[1])
   })
   
-  // 2. Verifica quais aulas JÁ TÊM registro na tabela de chamada
   const recordedLessons = new Set(
     allAttendance.value
       .filter(att => att.course_id === selectedCourse.value)
       .map(att => att.lesson)
   )
 
-  // 3. Retorna lista de objetos { name: 'Aula 01', done: true/false }
   return Array.from(lessonsSet)
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
     .map(lessonName => ({
@@ -101,7 +129,7 @@ const availableLessons = computed(() => {
     }))
 })
 
-// Seleciona a primeira aula pendente automaticamente (facilita a vida)
+// Seleciona a primeira aula pendente automaticamente
 watch(availableLessons, (newVal) => {
   if (newVal.length > 0 && !attendanceLesson.value) {
     const firstMissing = newVal.find(l => !l.done)
@@ -117,7 +145,7 @@ const kpis = computed(() => {
     if (match) uniqueLessons.add(`${a.course_id}-Aula${match[1]}`)
     else uniqueLessons.add(a.id)
   })
-  const totalClasses = uniqueLessons.size
+  const totalClasses = uniqueLessons.size // Agora reflete aulas práticas
   const totalDelivered = dashboardSubmissions.value.filter(s => DELIVERED_STATES.includes(s.state)).length
   const miniProjIds = dashboardAssignments.value.filter(a => a.title.toLowerCase().includes('miniprojeto')).map(a => a.id)
   const totalMiniDelivered = dashboardSubmissions.value.filter(s => miniProjIds.includes(s.assignment_id) && DELIVERED_STATES.includes(s.state)).length
@@ -130,22 +158,33 @@ const performanceStats = computed(() => {
   if (targetStudents.length === 0) return { general: 0, mini: 0, risk: 0 }
   let goodGeneral = 0, goodMini = 0, risk = 0
   const assignmentsMap = new Map()
-  assignments.value.forEach(a => assignmentsMap.set(a.id, a))
+  
+  // Mapeia apenas as atividades filtradas
+  dashboardAssignments.value.forEach(a => assignmentsMap.set(a.id, a))
 
   targetStudents.forEach(student => {
-    const studentSubs = submissions.value.filter(s => String(s.student_id) === String(student.id))
+    const studentSubs = dashboardSubmissions.value.filter(s => String(s.student_id) === String(student.id))
+    
     let totalAssignmentsStudent = studentSubs.length
+    
+    // Filtro extra de segurança para miniprojetos
     const miniSubs = studentSubs.filter(s => {
       const task = assignmentsMap.get(s.assignment_id)
       return task && task.title.toLowerCase().includes('miniprojeto')
     })
+    
     let totalMiniStudent = miniSubs.length
+    
+    // Evita divisão por zero
     totalAssignmentsStudent = totalAssignmentsStudent || 1
     totalMiniStudent = totalMiniStudent || 1
+    
     const deliveredGeneral = studentSubs.filter(s => DELIVERED_STATES.includes(s.state)).length
     const deliveredMini = miniSubs.filter(s => DELIVERED_STATES.includes(s.state)).length
+    
     const pctGeneral = (deliveredGeneral / totalAssignmentsStudent) * 100
     const pctMini = (deliveredMini / totalMiniStudent) * 100
+    
     if (pctGeneral >= 60) goodGeneral++
     if (pctMini >= 60) goodMini++
     if (pctGeneral < 75) risk++
@@ -162,6 +201,7 @@ const filteredAssignments = computed(() => {
   }).sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true }))
 })
 const filteredStudents = dashboardStudents
+
 function getStats(assignmentId) {
   return dashboardSubmissions.value.filter(s => s.assignment_id === assignmentId && PENDING_STATES.includes(s.state)).length
 }
@@ -195,6 +235,7 @@ watch([selectedCourse, attendanceLesson, activeTab], () => { if (activeTab.value
 const showModal = ref(false); const selectedStudentData = ref(null); const studentPendingTasks = ref([]);
 function openStudentDetails(student) {
   selectedStudentData.value = student
+  // Busca pendências apenas nas submissões filtradas (já ignora aulas teóricas)
   studentPendingTasks.value = dashboardSubmissions.value.filter(s => s.student_id === student.id && PENDING_STATES.includes(s.state)).map(s => { const task = assignments.value.find(a => a.id === s.assignment_id); return { ...s, taskTitle: task?.title, courseId: task?.course_id } }).sort((a, b) => a.taskTitle.localeCompare(b.taskTitle, undefined, { numeric: true }))
   showModal.value = true
 }
@@ -210,7 +251,7 @@ onMounted(fetchData)
   <div class="container">
     <header>
       <div class="header-top">
-        <h1>🚀 Monitor de Entregas</h1>
+        <h1>🚀 Monitor de Entregas (Filtro Ativo)</h1>
         <div class="filter-container">
           <select v-model="selectedCourse" class="course-filter">
             <option value="all">Todas as Turmas</option>
@@ -231,17 +272,17 @@ onMounted(fetchData)
     <main v-else>
       <div v-if="activeTab === 'dashboard'" class="dashboard-grid">
         <div class="main-chart-section card">
-          <h3>Pendências vs Entregas vs Presenças ({{ selectedCourse === 'all' ? 'Geral' : 'Filtrado' }})</h3>
+          <h3>Pendências vs Entregas ({{ selectedCourse === 'all' ? 'Geral' : 'Filtrado' }})</h3>
           <PendencyChart :key="selectedCourse" :courses="dashboardCourses" :assignments="dashboardAssignments" :submissions="dashboardSubmissions" :attendance="dashboardAttendance" />
         </div>
         <div class="kpi-section">
-          <div class="kpi-card"><span class="label">Total Aulas</span><span class="value">{{ kpis.totalClasses }}</span><div class="mini-graph">📚</div></div>
-          <div class="kpi-card"><span class="label">Entregas Gerais</span><span class="value green">{{ kpis.totalDelivered }}</span><div class="mini-graph">✅</div></div>
+          <div class="kpi-card"><span class="label">Desafios/Projetos</span><span class="value">{{ kpis.totalClasses }}</span><div class="mini-graph">📚</div></div>
+          <div class="kpi-card"><span class="label">Entregas Feitas</span><span class="value green">{{ kpis.totalDelivered }}</span><div class="mini-graph">✅</div></div>
           <div class="kpi-card"><span class="label">Miniprojetos Feitos</span><span class="value blue">{{ kpis.totalMiniDelivered }}</span><div class="mini-graph">💻</div></div>
         </div>
         <div class="donuts-section card">
-          <DonutChart :key="'gen-'+selectedCourse" :percent="performanceStats.general" color="#4ade80" label="Alunos > 60% (Geral)" />
-          <DonutChart :key="'mini-'+selectedCourse" :percent="performanceStats.mini" color="#38bdf8" label="Alunos > 60% (Miniprojetos)" />
+          <DonutChart :key="'gen-'+selectedCourse" :percent="performanceStats.general" color="#4ade80" label="Desempenho Geral (>60%)" />
+          <DonutChart :key="'mini-'+selectedCourse" :percent="performanceStats.mini" color="#38bdf8" label="Miniprojetos (>60%)" />
           <DonutChart :key="'risk-'+selectedCourse" :percent="performanceStats.risk" color="#ef4444" label="Alunos em Risco (<75%)" />
         </div>
       </div>
