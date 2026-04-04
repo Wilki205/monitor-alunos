@@ -1,12 +1,25 @@
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:4000'
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://192.168.1.10:4000'
+
+function getAuthHeaders() {
+  const token = localStorage.getItem('auth_token')
+
+  return {
+    'Content-Type': 'application/json',
+    ...(token ? { Authorization: `Bearer ${token}` } : {})
+  }
+}
 
 export async function getDashboardData() {
-  const response = await fetch(`${API_BASE_URL}/api/dashboard`, {
-    method: 'GET',
-    headers: {
-      'Content-Type': 'application/json'
-    }
-  })
+  let response
+
+  try {
+    response = await fetch(`${API_BASE_URL}/api/dashboard`, {
+      method: 'GET',
+      headers: getAuthHeaders()
+    })
+  } catch {
+    throw new Error('Não foi possível conectar à API.')
+  }
 
   if (!response.ok) {
     let message = 'Erro ao carregar dados do dashboard.'

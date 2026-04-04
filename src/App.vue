@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import PendencyChart from './components/PendencyChart.vue'
 import DonutChart from './components/DonutChart.vue'
+import LoginView from './components/LoginView.vue'
 
 import { useDashboardData } from './composables/useDashboardData'
 import { useAttendance } from './composables/useAttendance'
@@ -10,7 +11,17 @@ import { useStatusMessage } from './composables/useStatusMessage'
 import { normalizeId, normalizeText, formatDate } from './utils/helpers'
 import { PENDING_STATES } from './utils/assignmentRules'
 
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://192.168.1.10:4000'
+
 const activeTab = ref('dashboard')
+
+// Auth
+const currentUser = ref(null)
+const checkingSession = ref(true)
+
+// Filtros de turma
+const courseStatusFilter = ref('all')
+const courseSearch = ref('')
 
 // Busca
 const studentSearch = ref('')
@@ -47,7 +58,8 @@ const {
 const {
   statusMessage,
   errorMessage,
-  showStatus
+  showStatus,
+  clearStatus
 } = useStatusMessage()
 
 const {
@@ -64,6 +76,192 @@ const {
   allAttendance,
   showStatus
 })
+
+function getToken() {
+  return localStorage.getItem('auth_token')
+}
+
+function getAuthHeaders() {
+  const token = getToken()
+
+  return {
+    'Content-Type': 'application/json',
+    ...(token ? { Authorization: `Bearer ${token}` } : {})
+  }
+}
+
+function normalizeCourseState(course) {
+  const rawState = String(course?.status || course?.courseState || '').toUpperCase()
+
+  if (rawState === 'ARCHIVED') return 'archived'
+  if (rawState === 'ACTIVE') return 'active'
+  return 'unknown'
+}
+
+const visibleCourses = computed(() => {
+  const term = normalizeText(courseSearch.value)
+
+  return courses.value.filter(course => {
+    const courseState = normalizeCourseState(course)
+
+    const matchStatus =
+      courseStatusFilter.value === 'all' ||
+      courseState === courseStatusFilter.value
+
+    const matchSearch =
+      !term ||
+      normalizeText(course.name).includes(term) ||
+      normalizeText(course.section || '').includes(term)
+
+    return matchStatus && matchSearch
+  })
+})
+
+watch(visibleCourses, (list) => {
+  if (selectedCourse.value === 'all') return
+
+  const stillExists = list.some(course => normalizeId(course.id) === normalizeId(selectedCourse.value))
+
+  if (!stillExists) {
+    selectedCourse.value = 'all'
+  }
+})
+
+function resetUiState() {
+  activeTab.value = 'dashboard'
+  selectedCourse.value = 'all'
+  courseStatusFilter.value = 'all'
+  courseSearch.value = ''
+  studentSearch.value = ''
+  assignmentSearch.value = ''
+  showModal.value = false
+  selectedStudentData.value = null
+  studentPendingTasks.value = []
+  showAssignmentModal.value = false
+  selectedAssignment.value = null
+  assignmentPendingList.value = []
+}
+
+function clearSession() {
+  localStorage.removeItem('auth_token')
+  localStorage.removeItem('auth_user')
+  currentUser.value = null
+  resetUiState()
+  clearStatus()
+}
+
+function loadUserFromStorage() {
+  const token = localStorage.getItem('auth_token')
+  const user = localStorage.getItem('auth_user')
+
+  if (!token || !user) {
+    currentUser.value = null
+    return
+  }
+
+  try {
+    currentUser.value = JSON.parse(user)
+  } catch {
+    clearSession()
+  }
+}
+
+async function validateSession() {
+  const token = getToken()
+
+  if (!token) {
+    currentUser.value = null
+    return false
+  }
+
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/auth/me`, {
+      method: 'GET',
+      headers: getAuthHeaders()
+    })
+
+    const data = await response.json().catch(() => ({}))
+
+    if (!response.ok) {
+      throw new Error(data?.error || 'Sessão inválida.')
+    }
+
+    if (!data?.user) {
+      throw new Error('Sessão inválida.')
+    }
+
+    currentUser.value = data.user
+    localStorage.setItem('auth_user', JSON.stringify(data.user))
+    return true
+  } catch (error) {
+    const message = String(error?.message || '').toLowerCase()
+
+    if (
+      message.includes('token') ||
+      message.includes('sessão inválida') ||
+      message.includes('unauthorized') ||
+      message.includes('não informado') ||
+      message.includes('expirado')
+    ) {
+      clearSession()
+      return false
+    }
+
+    showStatus(error?.message || 'Não foi possível validar a sessão.', 'error')
+    return false
+  }
+}
+
+async function loadDashboard() {
+  try {
+    await fetchData()
+  } catch (error) {
+    const message = error?.message || 'Erro ao carregar dados.'
+
+    if (
+      message.toLowerCase().includes('token inválido') ||
+      message.toLowerCase().includes('token não informado') ||
+      message.toLowerCase().includes('expirado') ||
+      message.toLowerCase().includes('unauthorized')
+    ) {
+      clearSession()
+      return
+    }
+
+    showStatus(message, 'error')
+  }
+}
+
+async function initializeApp() {
+  checkingSession.value = true
+  clearStatus()
+  loadUserFromStorage()
+
+  if (!currentUser.value) {
+    checkingSession.value = false
+    return
+  }
+
+  const validSession = await validateSession()
+
+  if (!validSession) {
+    checkingSession.value = false
+    return
+  }
+
+  await loadDashboard()
+  checkingSession.value = false
+}
+
+async function handleLoginSuccess(user) {
+  currentUser.value = user
+  clearStatus()
+  await initializeApp()
+}
+
+function logout() {
+  clearSession()
+}
 
 // --- LISTAS FILTRADAS ---
 const filteredStudents = computed(() => {
@@ -108,7 +306,7 @@ function getStats(assignmentId) {
 
 // --- WATCHERS ---
 watch([selectedCourse, attendanceLesson, activeTab], () => {
-  if (activeTab.value === 'attendance') {
+  if (activeTab.value === 'attendance' && currentUser.value) {
     loadAttendanceData()
   }
 })
@@ -200,16 +398,26 @@ function cobrarIndividual(studentName, taskTitle) {
 
 // --- CICLO DE VIDA ---
 onMounted(async () => {
-  try {
-    await fetchData()
-  } catch (error) {
-    showStatus(error?.message || 'Erro ao carregar dados.', 'error')
-  }
+  await initializeApp()
 })
 </script>
 
 <template>
-  <div class="page-shell">
+  <LoginView
+    v-if="!currentUser && !checkingSession"
+    @login-success="handleLoginSuccess"
+  />
+
+  <div v-else-if="checkingSession" class="page-shell">
+    <div class="container">
+      <main class="loading-card">
+        <div class="loading-icon">🔐</div>
+        <p>Validando sessão...</p>
+      </main>
+    </div>
+  </div>
+
+  <div v-else class="page-shell">
     <div class="container">
       <header class="hero-card">
         <div class="hero-main">
@@ -221,18 +429,58 @@ onMounted(async () => {
             </p>
           </div>
 
-          <div class="hero-filter">
-            <label class="filter-label">Turma</label>
-            <select v-model="selectedCourse" class="course-filter">
-              <option value="all">Todas as Turmas</option>
-              <option
-                v-for="course in courses"
-                :key="course.id"
-                :value="course.id"
-              >
-                {{ course.name }}
-              </option>
-            </select>
+          <div class="hero-side">
+            <div class="hero-filter">
+              <label class="filter-label">Status das turmas</label>
+              <select v-model="courseStatusFilter" class="course-filter">
+                <option value="all">Todas</option>
+                <option value="active">Ativas</option>
+                <option value="archived">Arquivadas</option>
+              </select>
+            </div>
+
+            <div class="hero-filter">
+              <label class="filter-label">Buscar turma</label>
+              <input
+                v-model="courseSearch"
+                type="text"
+                class="search-input"
+                placeholder="Digite o nome da turma..."
+              />
+            </div>
+
+            <div class="hero-filter">
+              <label class="filter-label">Turma</label>
+              <select v-model="selectedCourse" class="course-filter">
+                <option value="all">Todas as Turmas</option>
+                <option
+                  v-for="course in visibleCourses"
+                  :key="course.id"
+                  :value="course.id"
+                >
+                  {{ course.name }}
+                </option>
+              </select>
+            </div>
+
+            <div class="user-box">
+              <div class="user-meta">
+                <img
+                  v-if="currentUser?.picture"
+                  :src="currentUser.picture"
+                  alt="Foto do usuário"
+                  class="user-avatar"
+                />
+                <div class="user-text">
+                  <strong>{{ currentUser?.name || 'Usuário' }}</strong>
+                  <span>{{ currentUser?.email }}</span>
+                </div>
+              </div>
+
+              <button class="logout-btn" @click="logout">
+                Sair
+              </button>
+            </div>
           </div>
         </div>
 
@@ -629,6 +877,13 @@ onMounted(async () => {
   max-width: 720px;
 }
 
+.hero-side {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 280px;
+}
+
 .eyebrow {
   display: inline-block;
   margin-bottom: 10px;
@@ -663,6 +918,68 @@ h1 {
   background: rgba(255, 250, 240, 0.88);
   border: 1px solid #eadfca;
   border-radius: 20px;
+}
+
+.user-box {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+  background: rgba(255, 255, 255, 0.88);
+  border: 1px solid #eadfca;
+  border-radius: 18px;
+}
+
+.user-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.user-avatar {
+  width: 42px;
+  height: 42px;
+  border-radius: 999px;
+  object-fit: cover;
+  border: 2px solid #fed7aa;
+}
+
+.user-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.user-text strong {
+  color: #1e3a8a;
+  font-size: 0.95rem;
+}
+
+.user-text span {
+  color: #64748b;
+  font-size: 0.82rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
+
+.logout-btn {
+  border: none;
+  background: #fff7ed;
+  color: #ea580c;
+  border: 1px solid #fed7aa;
+  padding: 10px 14px;
+  border-radius: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: 0.2s ease;
+}
+
+.logout-btn:hover {
+  background: #ffedd5;
 }
 
 .filter-label {
@@ -1267,6 +1584,10 @@ h1 {
   .donut-grid {
     grid-template-columns: 1fr;
   }
+
+  .hero-side {
+    width: 100%;
+  }
 }
 
 @media (max-width: 640px) {
@@ -1290,6 +1611,15 @@ h1 {
 
   .metric-value {
     font-size: 2rem;
+  }
+
+  .user-box {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .user-text span {
+    max-width: 100%;
   }
 }
 </style>
